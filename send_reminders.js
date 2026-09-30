@@ -1,0 +1,409 @@
+// send_reminders.js  (Detailing Valjevo)
+//
+// Pokreće se periodično (svakih 15 minuta) preko GitHub Actions.
+// Koristi Firebase Admin SDK da:
+//   1) pošalje push podsetnik korisnicima čiji termin počinje uskoro
+//      (podešeno u settings/salon -> notificationHoursBefore),
+//   2) pošalje push obaveštenje korisniku ako je ADMIN otkazao termin,
+//   3) pošalje push obaveštenje ADMINU kad neko zakaže NOV termin,
+//   4) pošalje push obaveštenje ADMINU kad KORISNIK otkaže termin.
+//
+// NAPOMENA O JEZIKU: poruke 1) i 2) idu KORISNIKU, pa se šalju na jeziku
+// koji korisnik ima podešen u svom profilu (users/{uid}.language, "SR" ili
+// "EN" - podešava se u aplikaciji, Profil -> prekidač za jezik). Poruke 3) i
+// 4) idu ADMINU i uvek ostaju na srpskom (admin panel je samo na srpskom).
+//
+// Ne šalje ništa dvaput (proverava notificationSent / adminCancelNotified /
+// adminNotified / userCancelAdminNotified polja pre slanja i postavlja ih
+// na true posle uspešnog slanja).
+
+const admin = require("firebase-admin");
+
+const serviceAccount = JSON.parse(process.env.FIREBASE_SERVICE_ACCOUNT_JSON);
+
+admin.initializeApp({
+  credential: admin.credential.cert(serviceAccount),
+});
+
+const db = admin.firestore();
+
+// ---------------------------------------------------------------------------
+// DATUMI U PORUKAMA: format dd.mm.yyyy (npr. 30.09.2026) + "danas"/"sutra".
+// "Danas" se racuna po vremenu u SRBIJI - GitHub server radi po UTC-u, pa
+// bi se oko ponoci inace pogresio dan.
+// ---------------------------------------------------------------------------
+const SALON_TZ = "Europe/Belgrade";
+
+// "2026-09-30" -> "30.09.2026"
+function formatDate(isoDate) {
+  const p = String(isoDate || "").split("-");
+  return p.length === 3 ? `${p[2]}.${p[1]}.${p[0]}` : String(isoDate || "");
+}
+
+// Datum (yyyy-mm-dd) u Srbiji: danas (0), sutra (1)...
+function salonDateIso(offsetDays = 0) {
+  const d = new Date(Date.now() + offsetDays * 24 * 60 * 60 * 1000);
+  return new Intl.DateTimeFormat("en-CA", {
+    timeZone: SALON_TZ, year: "numeric", month: "2-digit", day: "2-digit",
+  }).format(d);
+}
+
+// "danas, 30.09.2026" / "sutra, 01.10.2026" / "30.09.2026" (EN: today/tomorrow/on ...)
+function dayPhrase(isoDate, language) {
+  const date = formatDate(isoDate);
+  const en = language === "EN";
+  if (isoDate === salonDateIso(0)) return en ? `today, ${date}` : `danas, ${date}`;
+  if (isoDate === salonDateIso(1)) return en ? `tomorrow, ${date}` : `sutra, ${date}`;
+  return en ? `on ${date}` : date;
+}
+
+// Naziv usluge na jeziku korisnika (EN ako je unet prevod).
+function serviceNameFor(appointment, language) {
+  if (language === "EN" && appointment.serviceNameEn) return appointment.serviceNameEn;
+  return appointment.serviceName;
+}
+
+function reminderText(language, appointment) {
+  const when = dayPhrase(appointment.date, language);
+  const service = serviceNameFor(appointment, language);
+  if (language === "EN") {
+    return {
+      title: "Appointment reminder",
+      body: `You have an appointment ${when} at ${appointment.startTime}. Service: ${service}.`,
+    };
+  }
+  return {
+    title: "Podsetnik za termin",
+    body: `Imate zakazan termin ${when} u ${appointment.startTime}. Usluga: ${service}.`,
+  };
+}
+
+function adminCancellationText(language, appointment) {
+  const when = dayPhrase(appointment.date, language);
+  const service = serviceNameFor(appointment, language);
+  if (language === "EN") {
+    return {
+      title: "Appointment cancelled",
+      body: `Your appointment ${when} at ${appointment.startTime} (${service}) has been cancelled by Detailing Valjevo.`,
+    };
+  }
+  return {
+    title: "Termin otkazan",
+    body: `Vaš termin ${when} u ${appointment.startTime} (${service}) je otkazan od strane Detailing Valjevo.`,
+  };
+}
+
+function reassignmentText(language, appointment) {
+  const when = dayPhrase(appointment.date, language);
+  const service = serviceNameFor(appointment, language);
+  if (language === "EN") {
+    return {
+      title: "Detailer changed",
+      body: `Your appointment ${when} at ${appointment.startTime} (${service}) has been reassigned to ${appointment.employeeName}.`,
+    };
+  }
+  return {
+    title: "Majstor promenjen",
+    body: `Vaš termin ${when} u ${appointment.startTime} (${service}) je dodeljen majstoru: ${appointment.employeeName}.`,
+  };
+}
+
+async function sendReminders() {
+  const settingsDoc = await db.collection("settings").doc("salon").get();
+  const hoursBefore =
+    (settingsDoc.exists && settingsDoc.data().notificationHoursBefore) || 2;
+
+  const now = Date.now();
+  const reminderThreshold = now + hoursBefore * 60 * 60 * 1000;
+
+  const snapshot = await db
+    .collection("appointments")
+    .where("status", "==", "ZAKAZAN")
+    .where("timestamp", ">", now)
+    .where("timestamp", "<=", reminderThreshold)
+    .get();
+
+  console.log(`[podsetnici] Pronadjeno ${snapshot.size} termina za podsetnik (kandidati).`);
+
+  for (const doc of snapshot.docs) {
+    const appointment = doc.data();
+    if (appointment.notificationSent === true) continue;
+
+    const userDoc = await db.collection("users").doc(appointment.userId).get();
+    const fcmToken = userDoc.exists ? userDoc.data().fcmToken : null;
+    const language = userDoc.exists ? (userDoc.data().language || "SR") : "SR";
+
+    if (!fcmToken) {
+      console.log(`[podsetnici] Korisnik ${appointment.userId} nema fcmToken, preskacem.`);
+      continue;
+    }
+
+    const notification = reminderText(language, appointment);
+    const sent = await sendAndCleanupIfStale(fcmToken, appointment.userId, notification, "[podsetnici]");
+    if (sent) {
+      await doc.ref.update({ notificationSent: true });
+      console.log(`[podsetnici] Poslat podsetnik (${language}) za termin ${doc.id}`);
+    }
+  }
+}
+
+async function sendAdminCancellationNotifications() {
+  const snapshot = await db
+    .collection("appointments")
+    .where("status", "==", "OTKAZAN")
+    .where("cancelledBy", "==", "ADMIN")
+    .get();
+
+  console.log(`[otkazivanja] Pronadjeno ${snapshot.size} termina otkazanih od admina.`);
+
+  for (const doc of snapshot.docs) {
+    const appointment = doc.data();
+    if (appointment.adminCancelNotified === true) continue;
+
+    const userDoc = await db.collection("users").doc(appointment.userId).get();
+    const fcmToken = userDoc.exists ? userDoc.data().fcmToken : null;
+    const language = userDoc.exists ? (userDoc.data().language || "SR") : "SR";
+
+    if (!fcmToken) {
+      await doc.ref.update({ adminCancelNotified: true });
+      continue;
+    }
+
+    const notification = adminCancellationText(language, appointment);
+    const sent = await sendAndCleanupIfStale(fcmToken, appointment.userId, notification, "[otkazivanja]");
+    if (sent) {
+      await doc.ref.update({ adminCancelNotified: true });
+      console.log(`[otkazivanja] Poslato obavestenje (${language}) za termin ${doc.id}`);
+    }
+  }
+}
+
+async function getAdminTokens() {
+  const whitelistSnap = await db.collection("admin_whitelist").get();
+  const adminPhones = whitelistSnap.docs.map((d) => d.id);
+
+  const adminTokens = [];
+  for (const phone of adminPhones) {
+    const usersSnap = await db.collection("users").where("telefon", "==", phone).get();
+    usersSnap.forEach((doc) => {
+      const token = doc.data().fcmToken;
+      if (token) adminTokens.push({ token, userDocId: doc.id });
+    });
+  }
+  return adminTokens;
+}
+
+/** Salje notifikaciju na dati token. Ako Firebase kaze da token vise nije
+ * registrovan (aplikacija deinstalirana / token istekao), automatski ga
+ * brise iz Firestore profila da se ne pokusava ponovo uzalud ubuduce. */
+async function sendAndCleanupIfStale(token, userDocId, notification, logTag) {
+  try {
+    await admin.messaging().send({
+      token,
+      notification,
+      // Detailing Valjevo: bela silueta + zlatna boja (isto kao u aplikaciji)
+      android: { notification: { icon: "ic_notification", color: "#E2B03E", sound: "default" } },
+      apns: { payload: { aps: { sound: "default" } } },
+    });
+    return true;
+  } catch (err) {
+    const staleCodes = ["messaging/registration-token-not-registered", "messaging/invalid-registration-token"];
+    if (staleCodes.includes(err.code) || (err.message && err.message.includes("NotRegistered"))) {
+      console.log(`${logTag} Token je zastareo, brisem ga iz profila korisnika ${userDocId}.`);
+      try {
+        await db.collection("users").doc(userDocId).update({ fcmToken: admin.firestore.FieldValue.delete() });
+      } catch (cleanupErr) {
+        console.error(`${logTag} Greska pri brisanju zastarelog tokena:`, cleanupErr.message);
+      }
+    } else {
+      console.error(`${logTag} Greska slanja:`, err.message);
+    }
+    return false;
+  }
+}
+
+// Admin obavestenja OSTAJU na srpskom (admin panel je samo na srpskom).
+async function notifyAdminsOfNewBookings() {
+  const snapshot = await db
+    .collection("appointments")
+    .where("status", "==", "ZAKAZAN")
+    .where("adminNotified", "==", false)
+    .get();
+
+  console.log(`[admin-nov-termin] Pronadjeno ${snapshot.size} novih termina za prijavu adminu.`);
+  if (snapshot.empty) return;
+
+  const adminTokens = await getAdminTokens();
+  if (adminTokens.length === 0) {
+    console.log("[admin-nov-termin] Nijedan admin nema fcmToken ili whitelist je prazna.");
+  }
+
+  for (const doc of snapshot.docs) {
+    const appointment = doc.data();
+
+    for (const admin_ of adminTokens) {
+      await sendAndCleanupIfStale(
+        admin_.token,
+        admin_.userDocId,
+        {
+          title: "Novi termin zakazan",
+          body: `${appointment.userName} je zakazao/la: ${appointment.serviceName}, ${dayPhrase(appointment.date, "SR")} u ${appointment.startTime}.`,
+        },
+        "[admin-nov-termin]"
+      );
+    }
+
+    await doc.ref.update({ adminNotified: true });
+    console.log(`[admin-nov-termin] Admin obavesten za termin ${doc.id}`);
+  }
+}
+
+async function notifyAdminOfUserCancellations() {
+  const snapshot = await db
+    .collection("appointments")
+    .where("status", "==", "OTKAZAN")
+    .where("cancelledBy", "==", "USER")
+    .where("userCancelAdminNotified", "==", false)
+    .get();
+
+  console.log(`[admin-otkazivanje] Pronadjeno ${snapshot.size} termina koje je korisnik otkazao.`);
+  if (snapshot.empty) return;
+
+  const adminTokens = await getAdminTokens();
+  if (adminTokens.length === 0) {
+    console.log("[admin-otkazivanje] Nijedan admin nema fcmToken ili whitelist je prazna.");
+  }
+
+  for (const doc of snapshot.docs) {
+    const appointment = doc.data();
+
+    for (const admin_ of adminTokens) {
+      await sendAndCleanupIfStale(
+        admin_.token,
+        admin_.userDocId,
+        {
+          title: "Korisnik je otkazao termin",
+          body: `${appointment.userName} je otkazao/la: ${appointment.serviceName}, ${dayPhrase(appointment.date, "SR")} u ${appointment.startTime}. Termin je sada slobodan.`,
+        },
+        "[admin-otkazivanje]"
+      );
+    }
+
+    await doc.ref.update({ userCancelAdminNotified: true });
+    console.log(`[admin-otkazivanje] Admin obavesten za termin ${doc.id}`);
+  }
+}
+
+/**
+ * Termini koji su ZAKAZANI ali čije je vreme već prošlo automatski se
+ * prebacuju u status ZAVRSEN (umesto da zauvek ostanu ZAKAZAN u bazi).
+ */
+/**
+ * NOVO: obaveštava korisnika kad admin promeni dodeljenog frizera na
+ * njegovom terminu (Admin panel -> Termini -> "Promeni frizera"). Android
+ * strana postavlja employeeReassignedNotified=false u istoj transakciji
+ * kojom menja frizera; ova funkcija to detektuje, šalje obaveštenje na
+ * korisnikovom jeziku, i vraća polje na true.
+ */
+async function notifyUserOfReassignment() {
+  const snapshot = await db
+    .collection("appointments")
+    .where("status", "==", "ZAKAZAN")
+    .where("employeeReassignedNotified", "==", false)
+    .get();
+
+  console.log(`[promena-frizera] Pronadjeno ${snapshot.size} termina sa promenjenim frizerom.`);
+  if (snapshot.empty) return;
+
+  for (const doc of snapshot.docs) {
+    const appointment = doc.data();
+
+    const userDoc = await db.collection("users").doc(appointment.userId).get();
+    const fcmToken = userDoc.exists ? userDoc.data().fcmToken : null;
+    const language = userDoc.exists ? (userDoc.data().language || "SR") : "SR";
+
+    if (!fcmToken) {
+      await doc.ref.update({ employeeReassignedNotified: true });
+      continue;
+    }
+
+    const notification = reassignmentText(language, appointment);
+    const sent = await sendAndCleanupIfStale(fcmToken, appointment.userId, notification, "[promena-frizera]");
+    if (sent) {
+      await doc.ref.update({ employeeReassignedNotified: true });
+      console.log(`[promena-frizera] Poslato obavestenje (${language}) za termin ${doc.id}`);
+    }
+  }
+}
+
+async function finalizePastAppointments() {
+  const now = Date.now();
+  const snapshot = await db
+    .collection("appointments")
+    .where("status", "==", "ZAKAZAN")
+    .where("timestamp", "<", now)
+    .get();
+
+  console.log(`[zavrsavanje] Pronadjeno ${snapshot.size} proslih termina za oznacavanje kao ZAVRSEN.`);
+
+  for (const doc of snapshot.docs) {
+    try {
+      await doc.ref.update({ status: "ZAVRSEN" });
+      console.log(`[zavrsavanje] Termin ${doc.id} oznacen kao ZAVRSEN.`);
+    } catch (err) {
+      console.error(`[zavrsavanje] Greska za termin ${doc.id}:`, err.message);
+    }
+  }
+}
+
+/**
+ * SAMO OTKAZANI termini stariji od 24h se trajno brišu (zajedno sa
+ * eventualnim appointment_slots dokumentima). Završeni (ZAVRSEN) termini se
+ * NE brišu — ostaju kao poslovna evidencija (istorija posećenosti/
+ * prihoda). Ako želiš i njih da čistiš posle nekog vremena, javi mi period.
+ */
+async function cleanupOldCancelledAppointments() {
+  const cutoff = Date.now() - 24 * 60 * 60 * 1000;
+  const snapshot = await db
+    .collection("appointments")
+    .where("status", "==", "OTKAZAN")
+    .where("timestamp", "<", cutoff)
+    .get();
+
+  console.log(`[ciscenje] Pronadjeno ${snapshot.size} OTKAZANIH termina starijih od 24h za trajno brisanje.`);
+
+  for (const doc of snapshot.docs) {
+    try {
+      const slotsSnap = await db
+        .collection("appointment_slots")
+        .where("appointmentId", "==", doc.id)
+        .get();
+
+      const batch = db.batch();
+      slotsSnap.docs.forEach((slotDoc) => batch.delete(slotDoc.ref));
+      batch.delete(doc.ref);
+      await batch.commit();
+
+      console.log(`[ciscenje] Obrisan otkazan termin ${doc.id} i ${slotsSnap.size} pratecih slot dokumenata.`);
+    } catch (err) {
+      console.error(`[ciscenje] Greska brisanja termina ${doc.id}:`, err.message);
+    }
+  }
+}
+
+(async () => {
+  try {
+    await sendReminders();
+    await sendAdminCancellationNotifications();
+    await notifyAdminsOfNewBookings();
+    await notifyAdminOfUserCancellations();
+    await notifyUserOfReassignment();
+    await finalizePastAppointments();
+    await cleanupOldCancelledAppointments();
+    console.log("Gotovo.");
+    process.exit(0);
+  } catch (err) {
+    console.error("Neocekivana greska:", err);
+    process.exit(1);
+  }
+})();
