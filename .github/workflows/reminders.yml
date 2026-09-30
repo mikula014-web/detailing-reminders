@@ -1,9 +1,13 @@
 name: Detailing Reminders
 
 on:
+  workflow_dispatch:
   schedule:
     - cron: "7,22,37,52 * * * *"
-  workflow_dispatch:
+
+concurrency:
+  group: detailing-reminders
+  cancel-in-progress: false
 
 jobs:
   send-reminders:
@@ -17,7 +21,7 @@ jobs:
           node-version: 22
 
       - name: Instaliraj zavisnosti
-        run: npm install
+        run: npm install --no-audit --no-fund
 
       - name: Posalji podsetnike i obavestenja
         run: node send_reminders.js
